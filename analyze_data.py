@@ -2,34 +2,33 @@ from __future__ import annotations
 
 """Memory-conscious terrain analog search for large NumPy DEM files.
 
-The Earth DEM is opened read-only with NumPy memory mapping. Search candidates
-are scored in row chunks; the script never converts the full Earth DEM or its
-terrain features into in-memory arrays. Runtime can still be substantial because
-it compares every sampled candidate window with the Moon template.
+The Earth DEM is opened read-only using memory mapping. Search is performed on
+sampled candidate windows and computes Earth features in row chunks. Configure
+STRIDE and EARTH_BBOX below to trade search coverage for runtime.
 """
 
-import heapq
 import json
 from pathlib import Path
 from typing import Any
 
 import matplotlib
 
-# Use a non-interactive backend so the script works in terminals and headless runs.
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from rasterio import Affine
 from scipy import ndimage
 
-
 PROCESSED_DIR = Path("data/processed")
 RESULTS_FILE = Path("top_terrain_analogs.json")
 OUTPUT_IMAGE_TEMPLATE = "analog_comparison_rank_{rank}.png"
 TOP_N = 5
-STRIDE = 20
+STRIDE = 100  # Increase for speed; smaller values sample more candidate locations.
 CHUNK_ROWS = 64
 PLOT_MAX_DIMENSION = 1200
+# Optional (row_start, row_stop, col_start, col_stop), pixel bounds in the full
+# Earth array. Set to None for a global scan. Example: (10000, 20000, 30000, 40000)
+EARTH_BBOX: tuple[int, int, int, int] | None = None
 WEIGHT_COMBINATIONS = [
     (0.50, 0.25, 0.25),
     (0.60, 0.20, 0.20),
@@ -43,24 +42,18 @@ def _load_single_array(pattern: str) -> np.ndarray:
     """Open the unique matching .npy file as a read-only memory map."""
     files = sorted(PROCESSED_DIR.glob(pattern))
     if not files:
-        raise FileNotFoundError(
-            f"No files matching {pattern!r} found in {PROCESSED_DIR}"
-        )
+        raise FileNotFoundError(f"No files matching {pattern!r} in {PROCESSED_DIR}")
     if len(files) > 1:
         raise RuntimeError(
             f"Expected one file matching {pattern!r}, found: "
             + ", ".join(str(path) for path in files)
         )
-
-    # Do not wrap this in np.asarray: preserving the memmap avoids an eager copy.
     return np.load(files[0], mmap_mode="r", allow_pickle=False)
 
 
 def load_data_and_metadata() -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """Memory-map the Earth and Moon grids and load their spatial metadata."""
     earth_grid = _load_single_array("normalized_earth_*.npy")
     moon_grid = _load_single_array("normalized_moon_*.npy")
-
     if earth_grid.ndim != 2 or moon_grid.ndim != 2:
         raise ValueError("Earth and Moon arrays must both be two-dimensional.")
 
@@ -79,172 +72,140 @@ def _read_feature_chunk(
     col_start: int,
     col_stop: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Read and derive features for a rectangle, using only a one-cell halo.
-
-    row_stop and col_stop are exclusive. NaNs are excluded from local
-    statistics. A derivative is computed when the center and at least one
-    finite neighbor are available in that direction.
-    """
+    """Read a bounded chunk and calculate elevation, slope and roughness."""
     height, width = grid.shape
-    if not (0 <= row_start < row_stop <= height):
-        raise ValueError("Invalid row bounds for feature chunk.")
-    if not (0 <= col_start < col_stop <= width):
-        raise ValueError("Invalid column bounds for feature chunk.")
+    if not (0 <= row_start < row_stop <= height and 0 <= col_start < col_stop <= width):
+        raise ValueError("Invalid feature-chunk bounds.")
 
-    src_r0 = max(0, row_start - 1)
-    src_r1 = min(height, row_stop + 1)
-    src_c0 = max(0, col_start - 1)
-    src_c1 = min(width, col_stop + 1)
+    # A one-pixel halo gives chunk-edge derivatives/statistics their neighbors.
+    src_r0, src_r1 = max(0, row_start - 1), min(height, row_stop + 1)
+    src_c0, src_c1 = max(0, col_start - 1), min(width, col_stop + 1)
     source = np.asarray(grid[src_r0:src_r1, src_c0:src_c1], dtype=np.float32)
     finite = np.isfinite(source)
     padded = np.pad(source, 1, mode="constant", constant_values=np.nan)
 
-    core_r0 = row_start - src_r0 + 1
-    core_c0 = col_start - src_c0 + 1
-    rows = slice(core_r0, core_r0 + row_stop - row_start)
-    cols = slice(core_c0, core_c0 + col_stop - col_start)
+    core_r0, core_c0 = row_start - src_r0 + 1, col_start - src_c0 + 1
+    out_h, out_w = row_stop - row_start, col_stop - col_start
+    rows = slice(core_r0, core_r0 + out_h)
+    cols = slice(core_c0, core_c0 + out_w)
     center = padded[rows, cols]
-    center_valid = np.isfinite(center)
+    left = padded[rows, slice(core_c0 - 1, core_c0 - 1 + out_w)]
+    right = padded[rows, slice(core_c0 + 1, core_c0 + 1 + out_w)]
+    up = padded[slice(core_r0 - 1, core_r0 - 1 + out_h), cols]
+    down = padded[slice(core_r0 + 1, core_r0 + 1 + out_h), cols]
 
-    left, right = padded[rows, slice(core_c0 - 1, core_c0 - 1 + col_stop - col_start)], padded[
-        rows, slice(core_c0 + 1, core_c0 + 1 + col_stop - col_start)
-    ]
-    up = padded[slice(core_r0 - 1, core_r0 - 1 + row_stop - row_start), cols]
-    down = padded[slice(core_r0 + 1, core_r0 + 1 + row_stop - row_start), cols]
-
-    left_ok, right_ok = np.isfinite(left), np.isfinite(right)
-    up_ok, down_ok = np.isfinite(up), np.isfinite(down)
+    center_ok = np.isfinite(center)
     dx = np.full(center.shape, np.nan, dtype=np.float32)
     dy = np.full(center.shape, np.nan, dtype=np.float32)
 
-    both = center_valid & left_ok & right_ok
+    left_ok, right_ok = np.isfinite(left), np.isfinite(right)
+    both = center_ok & left_ok & right_ok
     dx[both] = (right[both] - left[both]) * 0.5
-    only_right = center_valid & ~left_ok & right_ok
-    dx[only_right] = right[only_right] - center[only_right]
-    only_left = center_valid & left_ok & ~right_ok
-    dx[only_left] = center[only_left] - left[only_left]
+    use = center_ok & ~left_ok & right_ok
+    dx[use] = right[use] - center[use]
+    use = center_ok & left_ok & ~right_ok
+    dx[use] = center[use] - left[use]
 
-    both = center_valid & up_ok & down_ok
+    up_ok, down_ok = np.isfinite(up), np.isfinite(down)
+    both = center_ok & up_ok & down_ok
     dy[both] = (down[both] - up[both]) * 0.5
-    only_down = center_valid & ~up_ok & down_ok
-    dy[only_down] = down[only_down] - center[only_down]
-    only_up = center_valid & up_ok & ~down_ok
-    dy[only_up] = center[only_up] - up[only_up]
+    use = center_ok & ~up_ok & down_ok
+    dy[use] = down[use] - center[use]
+    use = center_ok & up_ok & ~down_ok
+    dy[use] = center[use] - up[use]
 
     slope = np.hypot(dx, dy)
     slope[~(np.isfinite(dx) & np.isfinite(dy))] = np.nan
 
-    # Compute nodata-aware 3x3 population standard deviation. The source
-    # includes a halo, so these neighborhood statistics are valid for the core.
-    source_values = np.where(finite, source, 0.0).astype(np.float32, copy=False)
-    source_mask = finite.astype(np.float32, copy=False)
-    value_sum = ndimage.uniform_filter(
-        source_values, size=3, mode="constant", cval=0.0
-    ) * 9.0
-    square_sum = ndimage.uniform_filter(
-        source_values * source_values, size=3, mode="constant", cval=0.0
-    ) * 9.0
-    count = ndimage.uniform_filter(
-        source_mask, size=3, mode="constant", cval=0.0
-    ) * 9.0
-
+    # Nodata-aware 3x3 local population standard deviation.
+    values = np.where(finite, source, 0.0).astype(np.float32, copy=False)
+    mask = finite.astype(np.float32, copy=False)
+    sums = ndimage.uniform_filter(values, size=3, mode="constant", cval=0) * 9
+    squares = ndimage.uniform_filter(values * values, size=3, mode="constant", cval=0) * 9
+    counts = ndimage.uniform_filter(mask, size=3, mode="constant", cval=0) * 9
     core = (slice(row_start - src_r0, row_stop - src_r0),
             slice(col_start - src_c0, col_stop - src_c0))
-    core_count = count[core]
+    count = counts[core]
     with np.errstate(divide="ignore", invalid="ignore"):
-        mean = value_sum[core] / core_count
-        variance = np.maximum(square_sum[core] / core_count - mean * mean, 0.0)
+        mean = sums[core] / count
+        variance = np.maximum(squares[core] / count - mean * mean, 0)
         roughness = np.sqrt(variance).astype(np.float32, copy=False)
-
-    roughness[(core_count == 0) | ~center_valid] = np.nan
+    roughness[(count == 0) | ~center_ok] = np.nan
     return center.copy(), slope, roughness
 
 
 def compute_terrain_features(grid: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Compute full-grid features in chunks (for small arrays/API use).
-
-    This helper returns full feature arrays, so do not call it on the 11.6 GB
-    Earth DEM. The matcher below uses _read_feature_chunk instead.
-    """
+    """Compute full-grid features chunkwise; use only for grids that fit in RAM."""
     slope = np.empty(grid.shape, dtype=np.float32)
     roughness = np.empty(grid.shape, dtype=np.float32)
     for row in range(0, grid.shape[0], CHUNK_ROWS):
-        row_stop = min(row + CHUNK_ROWS, grid.shape[0])
-        _, slope_chunk, rough_chunk = _read_feature_chunk(
-            grid, row, row_stop, 0, grid.shape[1]
+        stop = min(row + CHUNK_ROWS, grid.shape[0])
+        _, slope[row:stop], roughness[row:stop] = _read_feature_chunk(
+            grid, row, stop, 0, grid.shape[1]
         )
-        slope[row:row_stop] = slope_chunk
-        roughness[row:row_stop] = rough_chunk
     return slope, roughness
 
 
-def _validate_weights(weights_list: list[tuple[float, float, float]]) -> None:
-    if not weights_list:
+def _validate_weights(weights: list[tuple[float, float, float]]) -> None:
+    if not weights:
         raise ValueError("At least one weight combination is required.")
-    for weights in weights_list:
-        if len(weights) != 3 or any(weight < 0 for weight in weights):
-            raise ValueError(f"Weights must be three non-negative values: {weights!r}")
-        if not np.isclose(sum(weights), 1.0):
-            raise ValueError(f"Weights must sum to 1.0: {weights!r}")
+    for item in weights:
+        if len(item) != 3 or any(weight < 0 for weight in item):
+            raise ValueError(f"Weights must be three non-negative values: {item!r}")
+        if not np.isclose(sum(item), 1.0):
+            raise ValueError(f"Weights must sum to 1.0: {item!r}")
 
 
 def _window_starts(length: int, window: int, stride: int) -> list[int]:
     if window > length:
         return []
     starts = list(range(0, length - window + 1, stride))
-    final_start = length - window
-    if not starts or starts[-1] != final_start:
-        starts.append(final_start)
+    final = length - window
+    if not starts or starts[-1] != final:
+        starts.append(final)
     return starts
 
 
 def _score_candidate(
     earth_grid: np.ndarray,
     moon_grid: np.ndarray,
+    moon_features: tuple[np.ndarray, np.ndarray],
     row: int,
     col: int,
     chunk_rows: int,
 ) -> tuple[float, float, float] | None:
-    """Accumulate three RMSEs in row stripes without materializing a window."""
+    """Accumulate the three RMSE metrics over stripes to bound temporary memory."""
     template_rows, template_cols = moon_grid.shape
-    sums = np.zeros(3, dtype=np.float64)
-    counts = np.zeros(3, dtype=np.int64)
+    squared_error = np.zeros(3, dtype=np.float64)
+    valid_counts = np.zeros(3, dtype=np.int64)
+    moon_slope, moon_roughness = moon_features
 
     for offset in range(0, template_rows, chunk_rows):
-        height = min(chunk_rows, template_rows - offset)
+        stop = min(offset + chunk_rows, template_rows)
         earth_values, earth_slope, earth_roughness = _read_feature_chunk(
-            earth_grid,
-            row + offset,
-            row + offset + height,
-            col,
-            col + template_cols,
+            earth_grid, row + offset, row + stop, col, col + template_cols
         )
-        moon_values, moon_slope, moon_roughness = _read_feature_chunk(
-            moon_grid,
-            offset,
-            offset + height,
-            0,
-            template_cols,
+        moon_values, moon_slope_chunk, moon_rough_chunk = _read_feature_chunk(
+            moon_grid, offset, stop, 0, template_cols
         )
+        # Use the precomputed Moon terrain features; only its elevation stripe is read.
+        moon_slope_chunk = moon_slope[offset:stop]
+        moon_rough_chunk = moon_roughness[offset:stop]
 
-        for index, (first, second) in enumerate(
-            (
-                (earth_values, moon_values),
-                (earth_slope, moon_slope),
-                (earth_roughness, moon_roughness),
-            )
-        ):
+        for index, (first, second) in enumerate((
+            (earth_values, moon_values),
+            (earth_slope, moon_slope_chunk),
+            (earth_roughness, moon_rough_chunk),
+        )):
             valid = np.isfinite(first) & np.isfinite(second)
             if valid.any():
-                difference = first[valid].astype(np.float64) - second[valid].astype(
-                    np.float64
-                )
-                sums[index] += np.dot(difference, difference)
-                counts[index] += difference.size
+                delta = first[valid].astype(np.float64) - second[valid].astype(np.float64)
+                squared_error[index] += np.dot(delta, delta)
+                valid_counts[index] += delta.size
 
-    if np.any(counts == 0):
+    if np.any(valid_counts == 0):
         return None
-    return tuple(np.sqrt(sums / counts).tolist())
+    return tuple(np.sqrt(squared_error / valid_counts).tolist())
 
 
 def sliding_window_multimetric_search(
@@ -254,8 +215,13 @@ def sliding_window_multimetric_search(
     weights: list[tuple[float, float, float]] | None = None,
     top_n: int = TOP_N,
     chunk_rows: int = CHUNK_ROWS,
+    bounding_box: tuple[int, int, int, int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Search window/weight pairs and retain only the globally best results."""
+    """Search window/weight pairs, optionally restricting search to an Earth ROI.
+
+    bounding_box is (row_start, row_stop, col_start, col_stop), with stop
+    coordinates exclusive. Results contain pixel indices in the original grid.
+    """
     if stride <= 0 or chunk_rows <= 0 or top_n <= 0:
         raise ValueError("stride, chunk_rows, and top_n must be positive.")
     if earth_grid.ndim != 2 or moon_grid.ndim != 2:
@@ -263,37 +229,43 @@ def sliding_window_multimetric_search(
     weights = WEIGHT_COMBINATIONS if weights is None else weights
     _validate_weights(weights)
 
-    template_rows, template_cols = moon_grid.shape
-    row_starts = _window_starts(earth_grid.shape[0], template_rows, stride)
-    col_starts = _window_starts(earth_grid.shape[1], template_cols, stride)
-    if not row_starts or not col_starts:
-        raise ValueError("Moon template must fit inside the Earth grid.")
+    if bounding_box is None:
+        r0, r1, c0, c1 = 0, earth_grid.shape[0], 0, earth_grid.shape[1]
+    else:
+        if len(bounding_box) != 4:
+            raise ValueError("bounding_box must be (row_start, row_stop, col_start, col_stop).")
+        r0, r1, c0, c1 = map(int, bounding_box)
+        if not (0 <= r0 < r1 <= earth_grid.shape[0] and 0 <= c0 < c1 <= earth_grid.shape[1]):
+            raise ValueError(f"Bounding box {bounding_box} is outside Earth grid {earth_grid.shape}.")
 
-    # Small bounded list: never retain the potentially enormous set of matches.
+    template_rows, template_cols = moon_grid.shape
+    if r1 - r0 < template_rows or c1 - c0 < template_cols:
+        raise ValueError("Bounding box must be at least as large as the Moon template.")
+    row_starts = [r0 + offset for offset in _window_starts(r1 - r0, template_rows, stride)]
+    col_starts = [c0 + offset for offset in _window_starts(c1 - c0, template_cols, stride)]
+
+    # Moon is small; compute its slope/roughness once, not once per Earth candidate.
+    moon_slope, moon_roughness = compute_terrain_features(moon_grid)
+    moon_features = (moon_slope, moon_roughness)
     best: list[dict[str, Any]] = []
     candidate_count = len(row_starts) * len(col_starts)
     print(
-        f"Scanning {candidate_count:,} windows across {len(weights)} weight sets "
-        f"(chunk_rows={chunk_rows}, stride={stride})...",
+        f"Scanning {candidate_count:,} windows, {len(weights)} weight sets, "
+        f"stride={stride}, ROI=rows[{r0}:{r1}] cols[{c0}:{c1}]...",
         flush=True,
     )
 
-    for candidate_index, (row, col) in enumerate(
+    for index, (row, col) in enumerate(
         ((r, c) for r in row_starts for c in col_starts), start=1
     ):
-        rmse = _score_candidate(earth_grid, moon_grid, row, col, chunk_rows)
-        if rmse is None:
-            continue
-        rmse_elev, rmse_slope, rmse_rough = rmse
-
-        for w_elev, w_slope, w_rough in weights:
-            score = (
-                w_elev * rmse_elev
-                + w_slope * rmse_slope
-                + w_rough * rmse_rough
-            )
-            best.append(
-                {
+        rmse = _score_candidate(
+            earth_grid, moon_grid, moon_features, row, col, chunk_rows
+        )
+        if rmse is not None:
+            elev_rmse, slope_rmse, rough_rmse = rmse
+            for w_elev, w_slope, w_rough in weights:
+                score = w_elev * elev_rmse + w_slope * slope_rmse + w_rough * rough_rmse
+                best.append({
                     "row": row,
                     "col": col,
                     "score": float(score),
@@ -303,20 +275,16 @@ def sliding_window_multimetric_search(
                         "roughness": w_rough,
                     },
                     "rmse": {
-                        "elevation": rmse_elev,
-                        "slope": rmse_slope,
-                        "roughness": rmse_rough,
+                        "elevation": elev_rmse,
+                        "slope": slope_rmse,
+                        "roughness": rough_rmse,
                     },
-                }
-            )
-        best.sort(key=lambda result: (result["score"], result["row"], result["col"]))
-        del best[top_n:]
+                })
+            best.sort(key=lambda result: (result["score"], result["row"], result["col"]))
+            del best[top_n:]
 
-        if candidate_index % 100 == 0 or candidate_index == candidate_count:
-            print(
-                f"Scanned {candidate_index:,}/{candidate_count:,} windows",
-                flush=True,
-            )
+        if index % 100 == 0 or index == candidate_count:
+            print(f"Scanned {index:,}/{candidate_count:,} windows", flush=True)
 
     if not best:
         raise ValueError("No candidate windows had valid data for all metrics.")
@@ -330,26 +298,21 @@ def _earth_metadata_entry(metadata: dict[str, Any]) -> dict[str, Any]:
             return entry
     if "transform" in metadata:
         return metadata
-    raise KeyError(
-        "Earth spatial metadata must contain a 'transform' list, either at the "
-        "top level or under an 'earth' entry."
-    )
+    raise KeyError("Earth metadata must include a six-value 'transform'.")
 
 
 def convert_pixel_to_geographic(
     row: int, col: int, metadata_entry: dict[str, Any]
 ) -> tuple[float, float]:
-    """Convert a pixel center to projected raster coordinates (UTM meters if UTM)."""
-    transform_values = metadata_entry.get("transform")
-    if transform_values is None or len(transform_values) < 6:
+    transform = metadata_entry.get("transform")
+    if transform is None or len(transform) < 6:
         raise ValueError("Metadata entry must contain a six-value 'transform' list.")
-    affine = Affine(*transform_values[:6])
-    x_coord, y_coord = affine * (col + 0.5, row + 0.5)
-    return float(x_coord), float(y_coord)
+    affine = Affine(*transform[:6])
+    x, y = affine * (col + 0.5, row + 0.5)
+    return float(x), float(y)
 
 
 def _plot_sample(grid: np.ndarray, max_dimension: int) -> np.ndarray:
-    """Read a bounded, strided view for plotting instead of copying a large DEM."""
     row_step = max(1, int(np.ceil(grid.shape[0] / max_dimension)))
     col_step = max(1, int(np.ceil(grid.shape[1] / max_dimension)))
     return np.asarray(grid[::row_step, ::col_step], dtype=np.float32)
@@ -361,42 +324,32 @@ def plot_terrain_analog(
     result: dict[str, Any],
     rank: int,
 ) -> str:
-    """Save a downsampled side-by-side comparison without loading full rasters."""
     row, col = result["row"], result["col"]
-    template_rows, template_cols = moon_grid.shape
-    earth_window = earth_grid[
-        row : row + template_rows,
-        col : col + template_cols,
-    ]
+    h, w = moon_grid.shape
+    earth_window = earth_grid[row:row + h, col:col + w]
     if earth_window.shape != moon_grid.shape:
         raise ValueError(f"Earth window for rank {rank} does not match Moon template.")
 
-    moon_image = _plot_sample(moon_grid, PLOT_MAX_DIMENSION)
-    earth_image = _plot_sample(earth_window, PLOT_MAX_DIMENSION)
-    output_path = OUTPUT_IMAGE_TEMPLATE.format(rank=rank)
-
     fig, axes = plt.subplots(1, 2, figsize=(12, 6), constrained_layout=True)
-    axes[0].imshow(moon_image, cmap="terrain", interpolation="nearest")
+    axes[0].imshow(_plot_sample(moon_grid, PLOT_MAX_DIMENSION), cmap="terrain")
     axes[0].set_title("Lunar template")
-    axes[1].imshow(earth_image, cmap="terrain", interpolation="nearest")
-    axes[1].set_title(
-        f"Earth analog #{rank} (row={row}, col={col})\n"
-        f"Score={result['score']:.6f}"
-    )
+    axes[1].imshow(_plot_sample(earth_window, PLOT_MAX_DIMENSION), cmap="terrain")
+    axes[1].set_title(f"Earth analog #{rank}: row={row}, col={col}\nScore={result['score']:.6f}")
     for axis in axes:
         axis.set_axis_off()
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    output = OUTPUT_IMAGE_TEMPLATE.format(rank=rank)
+    fig.savefig(output, dpi=200, bbox_inches="tight")
     plt.close(fig)
-    return output_path
+    return output
 
 
 def main() -> None:
     earth_grid, moon_grid, metadata = load_data_and_metadata()
     print(
-        f"Earth grid: {earth_grid.shape}, dtype={earth_grid.dtype}, "
+        f"Earth grid {earth_grid.shape}, dtype={earth_grid.dtype}, "
         f"memory-mapped={isinstance(earth_grid, np.memmap)}"
     )
-    print(f"Moon template: {moon_grid.shape}, dtype={moon_grid.dtype}")
+    print(f"Moon template {moon_grid.shape}, dtype={moon_grid.dtype}")
 
     results = sliding_window_multimetric_search(
         earth_grid,
@@ -405,38 +358,29 @@ def main() -> None:
         weights=WEIGHT_COMBINATIONS,
         top_n=TOP_N,
         chunk_rows=CHUNK_ROWS,
+        bounding_box=EARTH_BBOX,
     )
     earth_metadata = _earth_metadata_entry(metadata)
-
     for rank, result in enumerate(results, start=1):
-        x_coord, y_coord = convert_pixel_to_geographic(
+        result["rank"] = rank
+        result["utm_x_m"], result["utm_y_m"] = convert_pixel_to_geographic(
             result["row"], result["col"], earth_metadata
         )
-        result["rank"] = rank
-        result["utm_x_m"] = x_coord
-        result["utm_y_m"] = y_coord
-        result["plot_file"] = plot_terrain_analog(
-            moon_grid, earth_grid, result, rank
-        )
+        result["plot_file"] = plot_terrain_analog(moon_grid, earth_grid, result, rank)
 
     with RESULTS_FILE.open("w", encoding="utf-8") as file:
         json.dump(results, file, indent=2)
-
-    print(f"\nTop {len(results)} terrain analogs:")
-    for result in results:
-        weights = result["weights"]
-        rmse = result["rmse"]
+    print(f"\nTop {len(results)} matches:")
+    for item in results:
+        w = item["weights"]
         print(
-            f"\n#{result['rank']} at row={result['row']}, col={result['col']}"
-            f" | score={result['score']:.6f}"
-            f" | weights E/S/R={weights['elevation']:.2f}/"
-            f"{weights['slope']:.2f}/{weights['roughness']:.2f}"
-            f" | RMSE E/S/R={rmse['elevation']:.6f}/"
-            f"{rmse['slope']:.6f}/{rmse['roughness']:.6f}"
-            f" | UTM X={result['utm_x_m']:.2f} m, Y={result['utm_y_m']:.2f} m"
-            f" | plot={result['plot_file']}"
+            f"#{item['rank']} row={item['row']} col={item['col']} "
+            f"score={item['score']:.6f} weights="
+            f"({w['elevation']:.2f},{w['slope']:.2f},{w['roughness']:.2f}) "
+            f"UTM=({item['utm_x_m']:.2f}, {item['utm_y_m']:.2f}) m "
+            f"plot={item['plot_file']}"
         )
-    print(f"\nSaved full results to {RESULTS_FILE}")
+    print(f"Saved results to {RESULTS_FILE}")
 
 
 if __name__ == "__main__":
