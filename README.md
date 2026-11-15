@@ -3,7 +3,17 @@
 A terrain-analog search workflow that compares a lunar digital elevation model (DEM) with Earth terrain. It preprocesses elevation rasters, calculates terrain features, searches Earth windows for similar patterns, and saves ranked matches, comparison images, and an optional interactive map.
 
 > [!WARNING]
-> **Choose the correct Earth coordinate system for your region before preprocessing.** The current code does **not** automatically choose a CRS based on your DEM. Its default, `EPSG:32616` (UTM zone 16N), is only appropriate for locations covered by that UTM zone. For a different Earth region, pass an appropriate projected CRS with meter units using `--target-crs`. Using the wrong CRS can make reprojection, reported coordinates, and map markers inaccurate. A single UTM CRS is not suitable for a global dataset; process global coverage as regional tiles, each with a suitable CRS.
+> **CRITICAL: choose the correct Earth coordinate system for your region before preprocessing.** The current code does **not** automatically choose a CRS based on your DEM. Its default, `EPSG:32616` (UTM zone 16N), is only appropriate for locations covered by that UTM zone. For a different Earth region, pass an appropriate projected CRS with meter units using `--target-crs`. Using the wrong CRS can make reprojection, reported coordinates, and map markers inaccurate. A single UTM CRS is not suitable for a global dataset; process global coverage as regional tiles, each with an appropriate CRS.
+
+> [!WARNING]
+> **CRITICAL: do not run the full exhaustive matcher by accident.** Running `python data_processing.py` without `--no-match` does both of the following: it preprocesses the DEMs, and then it starts the older exhaustive match routine. That routine can be extremely slow and memory-heavy because it checks many more candidate windows at full resolution. For the intended workflow, use:
+>
+> ```bash
+> python data_processing.py --no-match
+> python analyze_data.py
+> ```
+>
+> Use the `--no-match` flag unless you intentionally want the old slow matcher.
 
 > **The data are not included in this repository.** High-resolution DEMs and generated arrays can be many gigabytes. Including them would make cloning and updating the code difficult, and data providers may have their own licensing and attribution terms. Obtain suitable DEMs separately and keep them locally; this repository contains code and instructions, not a preloaded dataset.
 
@@ -94,7 +104,7 @@ Put at least one valid Earth GeoTIFF in `data/raw_earth/` and one valid lunar Ge
 
 ### 2. Preprocess
 
-Use `--no-match` to prepare arrays and metadata without starting the older exhaustive matcher:
+Use `--no-match` to prepare arrays and metadata without starting the old exhaustive matcher:
 
 ```bash
 python data_processing.py --no-match --resolution 30 --target-crs EPSG:32616
@@ -111,7 +121,13 @@ Replace `EPSG:32616` with the appropriate projected, meter-based CRS for your Ea
 
 `spatial_metadata.json` records processed paths, CRS, affine transform, grid dimensions, resolution, source filenames, and normalization details. Keep it with the arrays; the analysis and mapping scripts rely on it.
 
-> Running `python data_processing.py` **without** `--no-match` also starts the older full-resolution matcher after preprocessing. It can take a very long time and use substantial resources. For the recommended quick workflow, use `--no-match` and then run `analyze_data.py` separately.
+> [!WARNING]
+> **Do not forget `--no-match` unless you intentionally want the slow exhaustive search.** The default `python data_processing.py` command does preprocessing and then launches the older full-resolution aerial/terrain matcher. That routine explores many more candidate windows and can be extremely slow and memory-heavy. The intended path is:
+>
+> ```bash
+> python data_processing.py --no-match
+> python analyze_data.py
+> ```
 
 ### 3. Run the fast approximate search
 
