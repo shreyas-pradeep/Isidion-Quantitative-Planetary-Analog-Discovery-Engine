@@ -2,10 +2,9 @@ from __future__ import annotations
 
 """Fast, memory-mapped terrain analog search.
 
-The default is a QUICK APPROXIMATION intended to finish much sooner than a
-full-resolution global scan: it downsamples by 4 and evaluates at most 128
-candidate locations sampled across the search grid. Increase the candidate cap
-or set it to None for a more exhaustive (and potentially much longer) search.
+This is tuned for a quick approximate pass that usually finishes in a couple of
+minutes on a local machine. It only evaluates a sampled subset of candidate
+windows and keeps the top-ranked matches.
 """
 
 import json
@@ -40,8 +39,6 @@ WEIGHT_COMBINATIONS = [
     (0.30, 0.35, 0.35),
 ]
 
-# These are initialized independently in spawned processes. They are read-only
-# mmap views, so workers do not pickle or copy the 11.6 GB Earth array.
 _WORK_EARTH: np.ndarray | None = None
 _WORK_MOON: np.ndarray | None = None
 _WORK_MOON_SLOPE: np.ndarray | None = None
@@ -59,71 +56,104 @@ def _load_single_array(pattern: str) -> np.ndarray:
 
 
 def load_data_and_metadata() -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    earth = _load_single_array("normalized_earth_*.npy")
-    moon = _load_single_array("normalized_moon_*.npy")
-    if earth.ndim != 2 or moon.ndim != 2:
-        raise ValueError("Earth and Moon arrays must be two-dimensional.")
     metadata_path = PROCESSED_DIR / "spatial_metadata.json"
     if not metadata_path.exists():
         raise FileNotFoundError(f"Spatial metadata not found: {metadata_path}")
+
     with metadata_path.open(encoding="utf-8") as file:
         metadata = json.load(file)
+
+    earth_entries = metadata.get("earth", {})
+    moon_entries = metadata.get("moon", {})
+    if not earth_entries or not moon_entries:
+        raise KeyError("Metadata must contain non-empty 'earth' and 'moon' entries.")
+
+    earth_info = next(iter(earth_entries.values()))
+    moon_info = next(iter(moon_entries.values()))
+
+    earth_path = Path(__file__).resolve().parent / earth_info["processed_file"]
+    moon_path = Path(__file__).resolve().parent / moon_info["processed_file"]
+
+    if not earth_path.exists():
+        raise FileNotFoundError(f"Earth array not found: {earth_path}")
+    if not moon_path.exists():
+        raise FileNotFoundError(f"Moon array not found: {moon_path}")
+
+    earth = np.load(earth_path, mmap_mode="r", allow_pickle=False)
+    moon = np.load(moon_path, mmap_mode="r", allow_pickle=False)
+
+    if earth.ndim != 2 or moon.ndim != 2:
+        raise ValueError("Earth and Moon arrays must both be two-dimensional.")
+
     return earth, moon, metadata
 
 
 def _read_feature_chunk(
     grid: np.ndarray, row_start: int, row_stop: int, col_start: int, col_stop: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute elevation, slope and nodata-aware 3x3 roughness for a chunk."""
+    """Compute elevation, slope and nodata-aware 3x3 roughness for one chunk."""
     height, width = grid.shape
-    if not (0 <= row_start < row_stop <= height and 0 <= col_start < col_stop <= width):
-        raise ValueError("Invalid feature-chunk bounds.")
-    sr0, sr1 = max(0, row_start - 1), min(height, row_stop + 1)
-    sc0, sc1 = max(0, col_start - 1), min(width, col_stop + 1)
-    source = np.asarray(grid[sr0:sr1, sc0:sc1], dtype=np.float32)
+    if not (0 <= row_start < row_stop <= height):
+        raise ValueError("Invalid row bounds for feature chunk.")
+    if not (0 <= col_start < col_stop <= width):
+        raise ValueError("Invalid column bounds for feature chunk.")
+
+    src_r0 = max(0, row_start - 1)
+    src_r1 = min(height, row_stop + 1)
+    src_c0 = max(0, col_start - 1)
+    src_c1 = min(width, col_stop + 1)
+    source = np.asarray(grid[src_r0:src_r1, src_c0:src_c1], dtype=np.float32)
     finite = np.isfinite(source)
     padded = np.pad(source, 1, mode="constant", constant_values=np.nan)
-    rr, cc = row_start - sr0 + 1, col_start - sc0 + 1
-    out_h, out_w = row_stop - row_start, col_stop - col_start
-    rows, cols = slice(rr, rr + out_h), slice(cc, cc + out_w)
-    center = padded[rows, cols]
-    left = padded[rows, slice(cc - 1, cc - 1 + out_w)]
-    right = padded[rows, slice(cc + 1, cc + 1 + out_w)]
-    up = padded[slice(rr - 1, rr - 1 + out_h), cols]
-    down = padded[slice(rr + 1, rr + 1 + out_h), cols]
-    center_ok = np.isfinite(center)
 
-    dx = np.full(center.shape, np.nan, np.float32)
-    dy = np.full(center.shape, np.nan, np.float32)
-    lok, rok = np.isfinite(left), np.isfinite(right)
-    both = center_ok & lok & rok
+    core_r0 = row_start - src_r0 + 1
+    core_c0 = col_start - src_c0 + 1
+    rows = slice(core_r0, core_r0 + row_stop - row_start)
+    cols = slice(core_c0, core_c0 + col_stop - col_start)
+    center = padded[rows, cols]
+    center_valid = np.isfinite(center)
+
+    left = padded[rows, slice(core_c0 - 1, core_c0 - 1 + col_stop - col_start)]
+    right = padded[rows, slice(core_c0 + 1, core_c0 + 1 + col_stop - col_start)]
+    up = padded[slice(core_r0 - 1, core_r0 - 1 + row_stop - row_start), cols]
+    down = padded[slice(core_r0 + 1, core_r0 + 1 + row_stop - row_start), cols]
+
+    left_ok, right_ok = np.isfinite(left), np.isfinite(right)
+    up_ok, down_ok = np.isfinite(up), np.isfinite(down)
+    dx = np.full(center.shape, np.nan, dtype=np.float32)
+    dy = np.full(center.shape, np.nan, dtype=np.float32)
+
+    both = center_valid & left_ok & right_ok
     dx[both] = (right[both] - left[both]) * 0.5
-    use = center_ok & ~lok & rok
-    dx[use] = right[use] - center[use]
-    use = center_ok & lok & ~rok
-    dx[use] = center[use] - left[use]
-    uok, dok = np.isfinite(up), np.isfinite(down)
-    both = center_ok & uok & dok
+    only_right = center_valid & ~left_ok & right_ok
+    dx[only_right] = right[only_right] - center[only_right]
+    only_left = center_valid & left_ok & ~right_ok
+    dx[only_left] = center[only_left] - left[only_left]
+
+    both = center_valid & up_ok & down_ok
     dy[both] = (down[both] - up[both]) * 0.5
-    use = center_ok & ~uok & dok
-    dy[use] = down[use] - center[use]
-    use = center_ok & uok & ~dok
-    dy[use] = center[use] - up[use]
+    only_down = center_valid & ~up_ok & down_ok
+    dy[only_down] = down[only_down] - center[only_down]
+    only_up = center_valid & up_ok & ~down_ok
+    dy[only_up] = center[only_up] - up[only_up]
+
     slope = np.hypot(dx, dy)
     slope[~(np.isfinite(dx) & np.isfinite(dy))] = np.nan
 
-    values = np.where(finite, source, 0).astype(np.float32, copy=False)
-    mask = finite.astype(np.float32, copy=False)
-    sums = ndimage.uniform_filter(values, size=3, mode="constant", cval=0) * 9
-    squares = ndimage.uniform_filter(values * values, size=3, mode="constant", cval=0) * 9
-    counts = ndimage.uniform_filter(mask, size=3, mode="constant", cval=0) * 9
-    core = (slice(row_start - sr0, row_stop - sr0), slice(col_start - sc0, col_stop - sc0))
-    count = counts[core]
+    source_values = np.where(finite, source, 0.0).astype(np.float32, copy=False)
+    source_mask = finite.astype(np.float32, copy=False)
+    value_sum = ndimage.uniform_filter(source_values, size=3, mode="constant", cval=0.0) * 9.0
+    square_sum = ndimage.uniform_filter(source_values * source_values, size=3, mode="constant", cval=0.0) * 9.0
+    count = ndimage.uniform_filter(source_mask, size=3, mode="constant", cval=0.0) * 9.0
+
+    core = (slice(row_start - src_r0, row_stop - src_r0), slice(col_start - src_c0, col_stop - src_c0))
+    core_count = count[core]
     with np.errstate(divide="ignore", invalid="ignore"):
-        mean = sums[core] / count
-        variance = np.maximum(squares[core] / count - mean * mean, 0)
+        mean = value_sum[core] / core_count
+        variance = np.maximum(square_sum[core] / core_count - mean * mean, 0.0)
         roughness = np.sqrt(variance).astype(np.float32, copy=False)
-    roughness[(count == 0) | ~center_ok] = np.nan
+
+    roughness[(core_count == 0) | ~center_valid] = np.nan
     return center.copy(), slope, roughness
 
 
@@ -143,7 +173,6 @@ def _init_worker(
     scale_factor: int,
     chunk_rows: int,
 ) -> None:
-    """Open read-only mappings inside each worker (safe with macOS spawn)."""
     global _WORK_EARTH, _WORK_MOON, _WORK_MOON_SLOPE, _WORK_MOON_ROUGHNESS, _WORK_CHUNK_ROWS
     earth_map = np.load(earth_path, mmap_mode="r", allow_pickle=False)
     moon_map = np.load(moon_path, mmap_mode="r", allow_pickle=False)
@@ -155,7 +184,6 @@ def _init_worker(
 
 
 def _score_candidate(row: int, col: int) -> tuple[int, int, tuple[float, float, float] | None]:
-    """Score one candidate using worker-local mappings and bounded row chunks."""
     assert _WORK_EARTH is not None and _WORK_MOON is not None
     assert _WORK_MOON_SLOPE is not None and _WORK_MOON_ROUGHNESS is not None
     h, w = _WORK_MOON.shape
@@ -169,7 +197,9 @@ def _score_candidate(row: int, col: int) -> tuple[int, int, tuple[float, float, 
         moon_values = np.asarray(_WORK_MOON[offset:stop, :], dtype=np.float32)
         moon_slope = _WORK_MOON_SLOPE[offset:stop, :]
         moon_rough = _WORK_MOON_ROUGHNESS[offset:stop, :]
-        for i, (a, b) in enumerate(((earth_values, moon_values), (earth_slope, moon_slope), (earth_rough, moon_rough))):
+        for i, (a, b) in enumerate(
+            ((earth_values, moon_values), (earth_slope, moon_slope), (earth_rough, moon_rough))
+        ):
             valid = np.isfinite(a) & np.isfinite(b)
             if valid.any():
                 delta = a[valid].astype(np.float64) - b[valid].astype(np.float64)
@@ -181,7 +211,6 @@ def _score_candidate(row: int, col: int) -> tuple[int, int, tuple[float, float, 
 
 
 def _score_candidate_task(candidate: tuple[int, int]) -> tuple[int, int, tuple[float, float, float] | None]:
-    """Pool adapter: multiprocessing passes one (row, col) tuple per task."""
     row, col = candidate
     return _score_candidate(row, col)
 
@@ -207,8 +236,11 @@ def _sample_candidate_positions(
 
 
 def _results_for_candidate(
-    row: int, col: int, rmse: tuple[float, float, float],
-    weights: list[tuple[float, float, float]], scale_factor: int,
+    row: int,
+    col: int,
+    rmse: tuple[float, float, float],
+    weights: list[tuple[float, float, float]],
+    scale_factor: int,
     bbox: tuple[int, int, int, int],
 ) -> list[dict[str, Any]]:
     re, rs, rr = rmse
@@ -286,15 +318,13 @@ def search_weight_grid(
         del best[top_n:]
 
     if workers > 1:
+        earth_path = str(Path(earth_grid.filename).resolve())
+        moon_path = str(Path(moon_grid.filename).resolve())
         context = mp.get_context("spawn")
         pool = context.Pool(
             processes=workers,
             initializer=_init_worker,
-            initargs=(
-                str(Path(earth_grid.filename).resolve()),
-                str(Path(moon_grid.filename).resolve()),
-                (r0, r1, c0, c1), scale_factor, chunk_rows,
-            ),
+            initargs=(earth_path, moon_path, (r0, r1, c0, c1), scale_factor, chunk_rows),
         )
         try:
             tasks = pool.imap_unordered(_score_candidate_task, candidates, chunksize=1)
@@ -331,13 +361,11 @@ def sliding_window_multimetric_search(*args: Any, **kwargs: Any) -> list[dict[st
 
 
 def _earth_metadata_entry(metadata: dict[str, Any]) -> dict[str, Any]:
-    for key in ("earth", "Earth", "earth_metadata", "earth_raster"):
-        entry = metadata.get(key)
+    earth_entries = metadata.get("earth", {})
+    for entry in earth_entries.values():
         if isinstance(entry, dict) and "transform" in entry:
             return entry
-    if "transform" in metadata:
-        return metadata
-    raise KeyError("Earth metadata must include a six-value 'transform'.")
+    raise KeyError("Could not find an Earth metadata entry containing 'transform'.")
 
 
 def convert_pixel_to_geographic(row: int, col: int, metadata_entry: dict[str, Any]) -> tuple[float, float]:
