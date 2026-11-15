@@ -1,4 +1,4 @@
-# Isidion NASA Space Apps
+# Isidion: Quantitative Planetary Analog Discovery Engine
 
 A terrain-analog search workflow that compares a lunar digital elevation model (DEM) with Earth terrain. It preprocesses elevation rasters, calculates terrain features, searches Earth windows for similar patterns, and saves ranked matches, comparison images, and an optional interactive map.
 
