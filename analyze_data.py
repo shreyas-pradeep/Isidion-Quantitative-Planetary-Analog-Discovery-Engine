@@ -180,6 +180,12 @@ def _score_candidate(row: int, col: int) -> tuple[int, int, tuple[float, float, 
     return row, col, tuple(np.sqrt(sums / counts).tolist())
 
 
+def _score_candidate_task(candidate: tuple[int, int]) -> tuple[int, int, tuple[float, float, float] | None]:
+    """Pool adapter: multiprocessing passes one (row, col) tuple per task."""
+    row, col = candidate
+    return _score_candidate(row, col)
+
+
 def _validate_weights(weights: list[tuple[float, float, float]]) -> None:
     if not weights:
         raise ValueError("At least one weight combination is required.")
@@ -195,9 +201,7 @@ def _sample_candidate_positions(
     if max_candidates is None or total <= max_candidates:
         indices = range(total)
     else:
-        # Uniformly distribute a bounded number of trials across the full grid.
-        indices = np.linspace(0, total - 1, max_candidates, dtype=np.int64)
-        indices = np.unique(indices)
+        indices = np.unique(np.linspace(0, total - 1, max_candidates, dtype=np.int64))
     ncols = len(cols)
     return [(rows[int(i) // ncols], cols[int(i) % ncols]) for i in indices]
 
@@ -232,12 +236,7 @@ def search_weight_grid(
     workers: int = WORKERS,
     max_candidates: int | None = MAX_CANDIDATES,
 ) -> list[dict[str, Any]]:
-    """Parallel, downsampled candidate search; keeps only the best top_n results.
-
-    max_candidates defaults to 128 for a quick approximation. Set it to None to
-    evaluate all stride-spaced positions. Use scale_factor=2 or 4 for faster
-    low-resolution tests. Both settings trade match accuracy for runtime.
-    """
+    """Parallel, downsampled candidate search; keeps only the best top_n results."""
     if min(stride, top_n, chunk_rows, scale_factor, workers) <= 0:
         raise ValueError("stride, top_n, chunk_rows, scale_factor, and workers must be positive.")
     if max_candidates is not None and max_candidates <= 0:
@@ -278,6 +277,7 @@ def search_weight_grid(
         workers = 1
 
     best: list[dict[str, Any]] = []
+
     def consume(row: int, col: int, rmse: tuple[float, float, float] | None) -> None:
         if rmse is None:
             return
@@ -286,8 +286,6 @@ def search_weight_grid(
         del best[top_n:]
 
     if workers > 1:
-        if not hasattr(earth_grid, "filename") or not hasattr(moon_grid, "filename"):
-            raise ValueError("Multiprocessing requires .npy memory-mapped input arrays.")
         context = mp.get_context("spawn")
         pool = context.Pool(
             processes=workers,
@@ -299,7 +297,8 @@ def search_weight_grid(
             ),
         )
         try:
-            for i, (row, col, rmse) in enumerate(pool.imap_unordered(_score_candidate, candidates, chunksize=1), 1):
+            tasks = pool.imap_unordered(_score_candidate_task, candidates, chunksize=1)
+            for i, (row, col, rmse) in enumerate(tasks, 1):
                 consume(row, col, rmse)
                 if i % 16 == 0 or i == len(candidates):
                     print(f"Scored {i}/{len(candidates)} candidates", flush=True)
@@ -327,7 +326,6 @@ def search_weight_grid(
     return best
 
 
-# Keep the former function name available for callers using older versions.
 def sliding_window_multimetric_search(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
     return search_weight_grid(*args, **kwargs)
 
