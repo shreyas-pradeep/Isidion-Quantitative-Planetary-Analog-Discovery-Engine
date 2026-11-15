@@ -1,18 +1,21 @@
 # Isidion NASA Space Apps
 
-A terrain-analog search workflow that compares a lunar digital elevation model (DEM) with Earth terrain. It preprocesses elevation rasters, calculates terrain features, searches Earth windows for similar patterns, and saves ranked results, comparison images, and an optional interactive map.
+A terrain-analog search workflow that compares a lunar digital elevation model (DEM) with Earth terrain. It preprocesses elevation rasters, calculates terrain features, searches Earth windows for similar patterns, and saves ranked matches, comparison images, and an optional interactive map.
 
-> **The data are not included in this repository.** DEM files—especially large, high-resolution Earth rasters and processed NumPy arrays—can be many gigabytes. Committing them would make cloning and updating the code unnecessarily difficult, and data sources may have their own licensing or attribution requirements. You download or obtain appropriate DEMs separately and keep them on your computer. The repository contains the code and instructions, not a ready-to-run copy of the datasets.
+> [!WARNING]
+> **Choose the correct Earth coordinate system for your region before preprocessing.** The current code does **not** automatically choose a CRS based on your DEM. Its default, `EPSG:32616` (UTM zone 16N), is only appropriate for locations covered by that UTM zone. For a different Earth region, pass an appropriate projected CRS with meter units using `--target-crs`. Using the wrong CRS can make reprojection, reported coordinates, and map markers inaccurate. A single UTM CRS is not suitable for a global dataset; process global coverage as regional tiles, each with a suitable CRS.
+
+> **The data are not included in this repository.** High-resolution DEMs and generated arrays can be many gigabytes. Including them would make cloning and updating the code difficult, and data providers may have their own licensing and attribution terms. Obtain suitable DEMs separately and keep them locally; this repository contains code and instructions, not a preloaded dataset.
 
 ## What the project does
 
 1. Reads single-band Earth and lunar elevation GeoTIFFs.
-2. Reprojects Earth data to a projected, meter-based coordinate system and resamples lunar data to a meter-based grid.
-3. Normalizes valid elevation values and preserves nodata cells as `NaN`.
+2. Reprojects Earth data to a selected projected, meter-based CRS and resamples both grids to a requested pixel size.
+3. Normalizes valid elevation values to `[0, 1]`, preserving nodata as `NaN`.
 4. Compares a lunar terrain template against sampled Earth locations using elevation, slope, and local roughness.
-5. Writes ranked matches and side-by-side comparison plots. An optional script maps the Earth matches.
+5. Writes ranked matches and side-by-side plots. An optional script maps the Earth matches.
 
-The search is a terrain-pattern comparison, not a claim that lunar and terrestrial geology or gravity are equivalent.
+This is a numerical terrain-pattern comparison, not a claim that lunar and terrestrial geology or gravity are equivalent.
 
 ## Repository contents
 
@@ -29,21 +32,21 @@ The search is a terrain-pattern comparison, not a claim that lunar and terrestri
     └── processed/            # Generated .npy arrays and metadata
 ```
 
-Generated files are written locally, including `top_terrain_analogs.json`, `analog_comparison_rank_*.png`, and (if you run the mapping script) `terrain_analogs_map.html`.
+Generated files are local: `top_terrain_analogs.json`, `analog_comparison_rank_*.png`, and, if the mapping script is run, `terrain_analogs_map.html`.
 
-## Requirements
+## Requirements and installation
 
 - Python 3.10 or newer
-- A computer with enough free disk space for the source DEMs and generated arrays. The Earth array can be very large; memory mapping reduces startup memory use but does not eliminate disk, I/O, or processing requirements.
-- An internet connection to load the background tiles in the interactive map.
+- Enough free disk space for the input DEMs and processed arrays. Memory mapping reduces startup memory use but does not eliminate storage, I/O, or processing requirements.
+- An internet connection to load background tiles in the interactive map.
 
-Install the core dependencies from the repository root:
+Install core dependencies from the repository root:
 
 ```bash
 python -m pip install numpy scipy matplotlib rasterio
 ```
 
-For the optional interactive map, also install Folium:
+For the optional interactive map:
 
 ```bash
 python -m pip install folium
@@ -51,17 +54,17 @@ python -m pip install folium
 
 ## Input data: exactly what to use
 
-Use **digital elevation models (DEMs)** that store terrain elevation, not ordinary photographs, RGB satellite imagery, hillshade images, land-cover classifications, or rendered map images.
+Use **digital elevation models (DEMs)** that store terrain elevation—not ordinary photographs, RGB satellite imagery, hillshades, land-cover classifications, or rendered map images.
 
-Accepted inputs are:
+Accepted inputs:
 
-- **File format:** GeoTIFF, with a `.tif` or `.tiff` extension.
-- **Raster bands:** exactly one band containing elevation values. RGB or multi-band images are not accepted.
-- **Georeferencing:** each GeoTIFF must have a valid coordinate reference system (CRS). The lunar DEM must use a projected CRS whose linear units are meters. Missing CRS information or an unprojected lunar CRS will cause preprocessing to stop for that file.
-- **Nodata:** a GeoTIFF nodata value or mask is recommended; it is retained as `NaN` in processed arrays.
-- **Coverage and resolution:** choose a lunar DEM area you want to compare and an Earth DEM with a sufficiently large, useful area. Processing defaults to a 30-meter pixel size. A larger area or finer source data can generate very large files and take substantially longer.
+- **Format:** GeoTIFF (`.tif` or `.tiff`).
+- **Bands:** exactly one elevation band; multi-band RGB imagery is not accepted.
+- **CRS:** each GeoTIFF must have valid CRS metadata. The lunar input CRS must be projected and use meters. The Earth input must have a valid CRS so it can be reprojected.
+- **Nodata:** a GeoTIFF nodata value or mask is recommended and is represented as `NaN` in processed arrays.
+- **Coverage/resolution:** select a lunar DEM area to compare and an Earth DEM covering the Earth region you want to search. Preprocessing defaults to 30-meter pixels. Larger areas and finer resolution create larger arrays and take longer.
 
-Place the input files directly in these folders (the scripts scan these folders, not nested subfolders):
+Place files directly in these folders; the scripts do not scan nested folders:
 
 ```text
 data/
@@ -71,48 +74,44 @@ data/
     └── moon_dem.tif
 ```
 
-Use DEMs from sources whose download and reuse terms are suitable for your project. Keep any required source citations and attribution with your project materials.
+Use data whose provider terms permit your intended use. Keep any required source citations and attribution with your project materials.
 
-### Coordinate system note
+## Coordinate systems and regions
 
-Earth data are reprojected to `EPSG:32616` (UTM zone 16N) by default at 30-meter resolution. **That default is only appropriate for Earth locations covered by UTM zone 16N.** If your Earth DEM is elsewhere, choose a suitable projected CRS for that location using `--target-crs` when preprocessing. Earth data must use a projected CRS with meter units after reprojection.
+The Earth preprocessing default is `EPSG:32616`, UTM zone 16N. **This is not a universal Earth CRS.** Choose a suitable projected CRS for the area covered by your Earth DEM, in meters. For a local or regional DEM, an appropriate UTM zone is often a practical choice. The code currently requires the user to select the CRS; it does not automatically infer one from the data.
 
-The lunar input must already have a projected, meter-based CRS; the preprocessor resamples it while preserving its CRS. The metadata records the CRS and pixel-to-coordinate affine transform. Whether lunar coordinates can be converted to meaningful lunar latitude/longitude depends on the source DEM's CRS definition and datum.
+For example, `EPSG:32616` is appropriate only for a region in UTM zone 16N. Replace it in the command below with the correct EPSG code for your region. If your Earth dataset spans multiple UTM zones or the whole planet, do not treat it as one ordinary UTM grid: split it into regional tiles, select a suitable CRS for each, and process/search those regions separately. Reprojection to one local CRS over a very large area can distort distances and terrain sampling.
+
+The lunar input must already have a projected meter-based CRS. It is resampled while retaining its source CRS. Metadata records each grid's CRS and affine transform. Whether lunar grid coordinates can be converted into meaningful lunar latitude/longitude depends on the source CRS and its datum definition.
 
 ## Step-by-step instructions
 
-Run commands from the repository root—the folder containing `data_processing.py` and `analyze_data.py`.
+Run commands from the repository root—the directory containing `data_processing.py` and `analyze_data.py`.
 
-### 1. Add your DEM files
+### 1. Add your DEMs
 
-Put at least one valid Earth `.tif`/`.tiff` in `data/raw_earth/` and one valid lunar `.tif`/`.tiff` in `data/raw_moon/`. Create these directories if they do not exist.
+Put at least one valid Earth GeoTIFF in `data/raw_earth/` and one valid lunar GeoTIFF in `data/raw_moon/`. Create those directories if they do not exist.
 
-### 2. Preprocess the DEMs
+### 2. Preprocess
 
-Preprocess the inputs and write arrays plus metadata, without starting the older full-resolution matcher:
-
-```bash
-python data_processing.py --no-match
-```
-
-Optional arguments:
+Use `--no-match` to prepare arrays and metadata without starting the older exhaustive matcher:
 
 ```bash
 python data_processing.py --no-match --resolution 30 --target-crs EPSG:32616
 ```
 
-Change `EPSG:32616` to a suitable projected meter-based CRS for your Earth dataset. The default resolution is 30 meters. The preprocessing script creates `data/processed/` and writes files named from the source basenames, for example:
+Replace `EPSG:32616` with the appropriate projected, meter-based CRS for your Earth region. The default resolution is 30 meters; change it if appropriate for the datasets and your analysis. The preprocessing script creates `data/processed/` and writes files named from the source basenames, for example:
 
 ```text
-data/processed/
-├── earth_dem_earth.npy
-├── moon_dem_moon.npy
-└── spatial_metadata.json
+ data/processed/
+ ├── earth_dem_earth.npy
+ ├── moon_dem_moon.npy
+ └── spatial_metadata.json
 ```
 
-The metadata file records the processed paths, CRS, affine transform, grid dimensions, resolution, source filenames, and normalization details. Keep it alongside the generated arrays; the analysis and mapping scripts rely on it.
+`spatial_metadata.json` records processed paths, CRS, affine transform, grid dimensions, resolution, source filenames, and normalization details. Keep it with the arrays; the analysis and mapping scripts rely on it.
 
-> Running `python data_processing.py` **without** `--no-match` also starts the older exhaustive matcher after preprocessing. It can take a very long time and use substantial resources. For the recommended quick workflow, use `--no-match` and then run `analyze_data.py` separately.
+> Running `python data_processing.py` **without** `--no-match` also starts the older full-resolution matcher after preprocessing. It can take a very long time and use substantial resources. For the recommended quick workflow, use `--no-match` and then run `analyze_data.py` separately.
 
 ### 3. Run the fast approximate search
 
@@ -125,56 +124,67 @@ The analysis script reads the first Earth and Moon entries listed in `spatial_me
 - `top_terrain_analogs.json` — ranked candidates, scores, weights, feature RMSEs, UTM coordinates, and plot paths.
 - `analog_comparison_rank_1.png`, etc. — side-by-side plots of the downsampled lunar template and each Earth match.
 
-The default search checks up to 128 sampled candidate windows, at a downsampling factor of 4 and stride of 100. This is intentionally a quick approximate pass; it does **not** examine every possible Earth location or guarantee the global best match.
+The default search checks up to 128 sampled candidate windows, at a downsampling factor of 4 and stride of 100. It does **not** examine every possible Earth location or guarantee the global best match. The input Earth DEM must cover the place you want to find.
 
 ### 4. (Optional) Create an interactive map
 
-After `top_terrain_analogs.json` has been created, run:
+After `top_terrain_analogs.json` has been created:
 
 ```bash
 python -m pip install folium
 python map_analogs.py
 ```
 
-Open `terrain_analogs_map.html` in a browser. It displays numbered markers for the ranked Earth matches. Select a marker to see its score and coordinate details. Background map tiles require an internet connection. This script reads the results and spatial metadata and writes a new HTML file; it does not change the DEMs or analysis results.
+Open `terrain_analogs_map.html` in a browser. It displays numbered markers for the ranked Earth matches. Select a marker for its score and coordinate details. Background map tiles require an internet connection. This script reads the results and spatial metadata, then writes a new HTML file; it does not change DEMs or analysis results.
 
-## Understanding the results
+## Understanding the results and score
 
-Each result includes a candidate's pixel row and column, the scale factor used, a combined score, the feature weights and RMSEs, and Earth coordinates (`utm_x_m`, `utm_y_m`). The Earth CRS comes from the Earth entry in `spatial_metadata.json`; the default preprocessing CRS is UTM zone 16N, EPSG:32616.
+Each result includes a candidate's pixel row and column, scale factor, combined score, feature weights and RMSEs, and Earth coordinates (`utm_x_m`, `utm_y_m`). The Earth CRS comes from the Earth entry in `spatial_metadata.json` and should match the CRS selected during preprocessing.
 
-**A lower score means a closer match among the candidate windows that were actually tested.** The score combines weighted root-mean-square errors (RMSEs) for:
+The fast search calculates a root-mean-square error (RMSE) for each of elevation, slope, and roughness over finite overlapping samples, then combines them:
 
-- **Elevation** — normalized elevation values
-- **Slope** — local change in elevation
-- **Roughness** — local variation in elevation
+```text
+score = elevation_weight * elevation_RMSE
+      + slope_weight * slope_RMSE
+      + roughness_weight * roughness_RMSE
+```
 
-The score is a relative similarity measure, not a probability, a physical distance, or proof that the landscapes are geologically identical. The default weights are defined in `analyze_data.py`.
+The default weight combinations are defined near the top of `analyze_data.py`; each has three non-negative values summing to one. **Lower scores mean smaller weighted differences among candidates actually tested.** The score is a relative similarity measure, not a probability, physical distance, or proof of geological identity. The fast search has no maximum-score cutoff or minimum valid-overlap fraction; a candidate is skipped when any feature has no valid overlap.
 
-The plots use a terrain color map. In the quick-search plots, each panel may be autoscaled independently, so the same color in the two panels does not necessarily mean the same elevation. The displayed lunar patch is the downsampled template used by the search.
+The terrain-color plots are visual aids. Each panel can be scaled independently, so the same color in both panels does not necessarily mean the same numeric elevation. The score uses underlying array values, not the displayed colors.
 
-## Adjusting search speed and coverage
+### Important: top five may not mean five unique places
 
-The main controls are near the top of `analyze_data.py`:
+The script evaluates multiple weight combinations for each candidate and retains `TOP_N = 5` result records overall. The same Earth location can therefore appear more than once with different weights. The output is the top five **location-and-weight combinations**, not guaranteed to be five distinct locations.
 
-- `SCALE_FACTOR = 4`: samples every fourth pixel in each direction. Lowering it compares more detail but greatly increases work.
-- `STRIDE = 100`: spacing between tested candidate positions on the downsampled Earth grid. Lowering it tests more locations.
-- `MAX_CANDIDATES = 128`: caps the number of candidate windows. Increase it for a broader sample or set it to `None` to test every position generated by the stride. This can take much longer.
-- `EARTH_BBOX = None`: searches the full Earth array. Set it to `(row_start, row_stop, col_start, col_stop)` to limit the search to a region in the original Earth array's pixel coordinates.
-- `CHUNK_ROWS`: controls chunk size for feature processing. Smaller values can reduce temporary memory use but may increase processing overhead.
+The saved UTM coordinate is calculated from the candidate's starting pixel location (pixel center), not the center of the entire matched window. The plot displays the whole window.
+
+## Search settings: speed versus coverage
+
+The primary controls are near the top of `analyze_data.py`:
+
+- `SCALE_FACTOR = 4`: samples every fourth pixel in each direction. Lower values retain more detail but substantially increase work.
+- `STRIDE = 100`: spacing between tested starts on the downsampled Earth grid. Lower values test more positions; larger values are faster but skip more locations. At a 30-meter source pixel size, the defaults imply roughly 120-meter sample spacing and roughly 12-kilometer spacing between regular candidate starts.
+- `MAX_CANDIDATES = 128`: caps the tested windows. Increase it for broader sampling or set it to `None` to test every position generated by the stride. This may take much longer.
+- `EARTH_BBOX = None`: searches the full Earth array. Set `(row_start, row_stop, col_start, col_stop)` to restrict the search using original Earth-array pixel coordinates; stop indices are exclusive.
+- `CHUNK_ROWS = 64`: controls chunk size for feature processing. Smaller values can reduce temporary memory but add processing overhead.
 - `WORKERS`: number of parallel worker processes; the default uses at most two.
+- `TOP_N = 5`: number of result records retained.
 
-For a finer follow-up search, focus on a smaller region around an interesting candidate and reduce `STRIDE` and/or `SCALE_FACTOR`. A full-resolution exhaustive search over a huge DEM can be impractical.
+For a finer follow-up, restrict `EARTH_BBOX` around a promising area and reduce `STRIDE` and/or `SCALE_FACTOR`. A full-resolution exhaustive search over a huge DEM can be impractical.
 
 ## Troubleshooting
 
-- **Missing processed array:** check that `spatial_metadata.json` points to the exact `.npy` filenames in `data/processed/`. Do not rename or substitute an array unless it is the corresponding processed DEM.
-- **No DEMs processed:** confirm that the GeoTIFFs are directly inside the correct raw-data folder, are single-band elevation rasters, and contain a CRS. The lunar CRS must be projected and use meters.
-- **Large disk or slow processing:** use a smaller source DEM or smaller region, and verify available disk space before preprocessing. Generated `.npy` arrays can be large.
-- **Map does not display its background:** open the HTML file with an internet connection; the map tiles are loaded online.
+- **No DEMs processed:** make sure the GeoTIFFs are directly in the correct raw folder, are single-band elevation rasters, and contain CRS metadata. The lunar CRS must be projected and use meters.
+- **Wrong or implausible Earth coordinates:** verify that `--target-crs` is appropriate for the Earth DEM region. Do not rely on the default UTM zone 16N for other regions.
+- **Missing processed array:** check that `spatial_metadata.json` refers to existing `.npy` files in `data/processed/`.
+- **Multiple input DEMs:** the fast analysis currently selects the first Earth and first Moon metadata entries. Keep one of each in the workflow or verify which entries appear first in metadata.
+- **Large disk use or slow processing:** use a smaller source region or a coarser resolution and check free disk space before preprocessing. Generated arrays can be large.
+- **Map background is blank:** open the HTML file with an internet connection; background tiles are loaded online.
 
 ## License and data attribution
 
-The code is licensed under the terms in [`LICENSE`](LICENSE). That license does not automatically grant rights to any DEM data you obtain. Follow the terms and attribution requirements of each data provider.
+The code is licensed under the terms in [`LICENSE`](LICENSE). That license does not automatically grant rights to DEM data you obtain. Follow each data provider's license and attribution requirements.
 
 ## Acknowledgements
 
