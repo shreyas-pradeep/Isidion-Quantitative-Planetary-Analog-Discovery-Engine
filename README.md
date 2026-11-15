@@ -1,28 +1,183 @@
-# Isidion-Nasa-Space-Apps
+# Isidion NASA Space Apps
 
-## Running the terrain analog matcher
+A terrain-analog search tool for comparing lunar DEM data against Earth elevation data. The project preprocesses GeoTIFF rasters, normalizes their values, builds spatial metadata, and then tests candidate Earth windows against a lunar template using elevation, slope, and roughness similarity.
 
-The matcher opens the large Earth `.npy` elevation array read-only with NumPy memory mapping. It computes Earth terrain features in bounded chunks and keeps only the best matches. The top results are written to `top_terrain_analogs.json`, with a comparison PNG for each result.
+This repo was built to help identify the Earth analog most visually and statistically similar to a Moon terrain sample, using a fast approximate search pipeline suited to large rasters.
 
-Expected inputs:
+## Project goals
 
-- `data/processed/normalized_earth_*.npy`
-- `data/processed/normalized_moon_*.npy`
-- `data/processed/spatial_metadata.json` (Earth transform at the top level or under an `earth` key)
+- Load and normalize Earth and Moon DEMs from GeoTIFF inputs
+- Reproject and resample rasters to a common metric grid
+- Compute terrain-aware features: elevation, slope, and roughness
+- Search for nearby Earth windows matching a lunar template
+- Save ranked results and comparison plots for the best matches
 
-Install dependencies and run from the repository root:
+## Repository layout
+
+```text
+.
+├── README.md
+├── LICENSE
+├── analyze_data.py
+├── data_processing.py
+├── data/
+│   ├── raw_earth/
+│   ├── raw_moon/
+│   └── processed/
+│       ├── spatial_metadata.json
+│       ├── normalized_earth_*.npy
+│       ├── normalized_moon_*.npy
+│       └── analog comparison outputs
+└── top_terrain_analogs.json
+```
+
+## What each script does
+
+### `data_processing.py`
+
+Preprocesses raw DEM GeoTIFF files:
+
+- scans `data/raw_earth/` and `data/raw_moon/`
+- reprojects Earth rasters to a metric grid
+- resamples lunar rasters to a matching meter-based grid
+- normalizes each DEM to `[0, 1]` with NaN preserved for nodata
+- writes processed arrays and JSON metadata to `data/processed/`
+
+This script is the preprocessing pipeline for the terrain matching workflow.
+
+### `analyze_data.py`
+
+Runs the fast terrain-analog search:
+
+- loads the normalized Earth and Moon arrays
+- computes per-pixel slope and roughness features
+- samples candidate Earth windows across the grid
+- scores candidates using weighted RMSE across elevation, slope, and roughness
+- keeps the top results and generates comparison plots
+- writes ranked output to `top_terrain_analogs.json`
+
+This is the main analysis script for producing top analog matches.
+
+## Installation
+
+Use Python 3.10+ and install the required dependencies:
 
 ```bash
 python -m pip install numpy scipy matplotlib rasterio
+```
+
+## Data preparation
+
+Place your DEM files in the expected folders:
+
+```text
+data/
+├── raw_earth/
+│   └── your_earth_dem.tif
+├── raw_moon/
+│   └── your_moon_dem.tif
+└── processed/
+```
+
+The project expects GeoTIFFs with single-band elevation data. The Earth DEM is projected to EPSG:32616 by default, while lunar DEMs are resampled to a meter-based projected grid in their source CRS.
+
+## Running the preprocessing step
+
+From the repository root:
+
+```bash
+python data_processing.py
+```
+
+This produces processed arrays and updates `data/processed/spatial_metadata.json` with metadata like:
+
+- CRS
+- affine transform
+- width / height
+- resolution
+- source file paths
+- processed file paths
+
+## Running the analog search
+
+```bash
 python analyze_data.py
 ```
 
-### Speed and region-of-interest controls
+What this produces:
 
-`STRIDE` defaults to 100 pixels. Candidate windows are separated by this many pixels in both directions. Larger values run faster but may skip the true best match; reduce it for a finer search.
+- `top_terrain_analogs.json`
+- plot files such as `analog_comparison_rank_1.png`
+- ranked output printed to the terminal
 
-For an initial small-area test, set `EARTH_BBOX` in `analyze_data.py` to `(row_start, row_stop, col_start, col_stop)` using pixel coordinates in the original Earth array. Stop indices are exclusive. The box must be at least as large as the Moon template. Leave it as `None` for a full-grid search. Returned row/column coordinates remain relative to the original Earth grid, so the existing affine transform remains valid.
+## Output interpretation
 
-`CHUNK_ROWS` controls the working set used while scoring a candidate. Lower values reduce temporary memory at the cost of more Python overhead. The Moon template's terrain features are computed once and reused for all candidates. For initial testing, choose a small bounding box and a large stride, then refine the region and stride once the pipeline runs successfully.
+The top results are sorted by score, where lower is better. The score combines weighted RMSE values for:
 
-Memory mapping avoids loading the full DEM at startup, but the operating system may cache recently accessed file pages in available RAM. A global search can still take a long time because it evaluates every sampled candidate window.
+- elevation
+- slope
+- roughness
+
+This is a similarity score, not a physical probability. It indicates how closely a candidate region resembles the Moon template under the current feature weighting.
+
+### Example output entry
+
+```json
+{
+  "row": 2960,
+  "col": 5120,
+  "scale_factor": 4,
+  "score": 0.089094,
+  "weights": {
+    "elevation": 0.5,
+    "slope": 0.25,
+    "roughness": 0.25
+  },
+  "rmse": {
+    "elevation": 0.073,
+    "slope": 0.102,
+    "roughness": 0.088
+  }
+}
+```
+
+The plot side-by-side compares the Moon template and the best Earth analog found in the sampled search grid.
+
+## Search configuration
+
+The current analysis script uses a fast approximate search strategy. The following settings are important:
+
+- `STRIDE`: spacing between candidate windows
+- `SCALE_FACTOR`: downsampling factor used for the quick search
+- `MAX_CANDIDATES`: maximum number of candidate windows to score
+- `CHUNK_ROWS`: width of working chunks for feature evaluation
+- `WORKERS`: number of multiprocessing workers
+
+These are defined near the top of `analyze_data.py`.
+
+### Typical quick-search settings
+
+```python
+STRIDE = 100
+SCALE_FACTOR = 4
+MAX_CANDIDATES = 128
+WORKERS = min(2, os.cpu_count() or 1)
+```
+
+This allows a fast first pass over a large dataset without evaluating every possible location.
+
+## Notes and limitations
+
+- The search is intentionally approximate for speed.
+- It does not guarantee the global optimum over the full Earth DEM.
+- Lower scores are better because they represent smaller feature differences.
+- The plot color scale is normalized per image, so the colors are a visual aid rather than a direct physical measurement.
+- Performance can depend heavily on DEM size and available RAM.
+
+## License
+
+This project is licensed under the MIT License. See `LICENSE` for details.
+
+## Acknowledgements
+
+This project was developed for NASA Space Apps and demonstrates a terrain-analog matching workflow using normalized DEMs, terrain features, and ranked Earth-to-Moon comparison plots.
